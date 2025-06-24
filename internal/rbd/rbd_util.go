@@ -749,12 +749,13 @@ type trashSnapInfo struct {
 func flattenClonedRbdImages(
 	ctx context.Context,
 	snaps []librbd.SnapInfo,
-	pool, monitors, rbdImageName string,
+	pool, monitors, radosNamespace, rbdImageName string,
 	cr *util.Credentials,
 ) error {
 	rv := &rbdVolume{}
 	rv.Monitors = monitors
 	rv.Pool = pool
+	rv.RadosNamespace = radosNamespace
 	rv.RbdImageName = rbdImageName
 
 	defer rv.Destroy()
