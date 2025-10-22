@@ -1151,6 +1151,7 @@ func updateSnapshotDetails(ctx context.Context, rbdSnap *rbdSnapshot) error {
 		return err
 	}
 	rbdSnap.VolSize = vol.VolSize
+	rbdSnap.CreatedAt = vol.CreatedAt
 
 	return nil
 }
