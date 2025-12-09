@@ -280,8 +280,13 @@ func (l *luksWrapper) execCryptsetupCommand(stdin *string, args ...string) (stri
 	}
 
 	if err != nil {
-		return stdout, stderr, fmt.Errorf("an error (%v)"+
-			" occurred while running %s args: %v", err, program, sanitizedArgs)
+		// Include stderr if not empty
+		baseErr := fmt.Sprintf("an error (%v) occurred while running %s args: %v", err, program, sanitizedArgs)
+		if e := strings.TrimSpace(stderr); e != "" {
+			return stdout, stderr, fmt.Errorf("%s, stderr: %s", baseErr, e)
+		}
+
+		return stdout, stderr, fmt.Errorf("%s", baseErr)
 	}
 
 	return stdout, stderr, err
