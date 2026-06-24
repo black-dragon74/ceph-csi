@@ -1,0 +1,108 @@
+ARG SRC_DIR="/go/src/github.com/ceph/ceph-csi/"
+ARG GO_ARCH
+ARG HARDENED_BASE_IMAGE=debian:bookworm-slim
+
+FROM ${HARDENED_BASE_IMAGE} AS builder
+
+LABEL stage="build"
+
+ARG CSI_IMAGE_NAME=quay.io/cephcsi/cephcsi
+ARG CSI_IMAGE_VERSION=canary
+ARG GO_ARCH
+ARG SRC_DIR
+ARG GIT_COMMIT
+ARG GOROOT=/usr/local/go
+ARG CEPH_VERSION=tentacle
+
+COPY build.env /
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg \
+    && curl -fsSL https://download.ceph.com/keys/release.asc \
+        | gpg --dearmor -o /usr/share/keyrings/ceph-archive-keyring.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/ceph-archive-keyring.gpg] https://download.ceph.com/debian-${CEPH_VERSION}/ bookworm main" \
+        > /etc/apt/sources.list.d/ceph.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        librados-dev librbd-dev libcephfs-dev \
+        gcc libc6-dev make git pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN . /build.env && \
+    ( test -n "${GO_ARCH}" && exit 0; echo -e "\n\nMissing GO_ARCH argument for building image, install Golang or run: make image-cephcsi-hardened GOARCH=amd64\n\n"; exit 1 ) && \
+    mkdir -p ${GOROOT} && \
+    curl -fsSL https://go.dev/dl/go${GOLANG_VERSION}.linux-${GO_ARCH}.tar.gz \
+        | tar xzf - -C ${GOROOT} --strip-components=1
+
+RUN ${GOROOT}/bin/go version && ${GOROOT}/bin/go env
+
+ENV GOROOT=${GOROOT} \
+    GOPATH=/go \
+    CGO_ENABLED=1 \
+    GIT_COMMIT="${GIT_COMMIT}" \
+    ENV_CSI_IMAGE_VERSION="${CSI_IMAGE_VERSION}" \
+    ENV_CSI_IMAGE_NAME="${CSI_IMAGE_NAME}" \
+    PATH="${GOROOT}/bin:${GOPATH}/bin:${PATH}"
+
+WORKDIR ${SRC_DIR}
+
+COPY . ${SRC_DIR}
+
+RUN make cephcsi
+
+#-- Final container (hardened)
+FROM ${HARDENED_BASE_IMAGE}
+
+ARG SRC_DIR
+ARG CEPH_VERSION=tentacle
+ARG CSI_IMAGE_VERSION=canary
+ARG GO_ARCH
+
+LABEL maintainers="Ceph-CSI Authors" \
+    version=${CSI_IMAGE_VERSION} \
+    architecture=${GO_ARCH} \
+    description="Ceph-CSI Plugin (Hardened)" \
+    org.opencontainers.image.description="A minimal Ceph CSI image" \
+    org.opencontainers.image.licenses="Apache-2.0"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg \
+    && curl -fsSL https://download.ceph.com/keys/release.asc \
+        | gpg --dearmor -o /usr/share/keyrings/ceph-archive-keyring.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/ceph-archive-keyring.gpg] https://download.ceph.com/debian-${CEPH_VERSION}/ bookworm main" \
+        > /etc/apt/sources.list.d/ceph.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        cryptsetup-bin \
+        e2fsprogs \
+        kmod \
+        nfs-common \
+        nvme-cli \
+        openssl \
+        tzdata \
+        util-linux \
+        xfsprogs \
+        librados2 \
+        librbd1 \
+        libcephfs2 \
+        ceph-common \
+        ceph-fuse \
+        rbd-nbd \
+    && apt-get purge -y --auto-remove gnupg curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /etc/ceph \
+    && ln -sf /proc/mounts /etc/mtab \
+    && ln -sf /usr/bin/mount /usr/sbin/mount.ceph
+
+RUN groupadd -g 65532 nonroot \
+    && useradd -u 65532 -g 65532 -s /sbin/nologin -M nonroot
+
+COPY --from=builder ${SRC_DIR}/_output/cephcsi /usr/local/bin/cephcsi
+
+RUN [ $(ldd /usr/local/bin/cephcsi | grep -c '=> not found') = '0' ]
+
+USER 65532:65532
+
+ENTRYPOINT ["/usr/local/bin/cephcsi"]

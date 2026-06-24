@@ -66,6 +66,7 @@ LDFLAGS += -X $(GO_PROJECT)/internal/util.DriverVersion=$(CSI_IMAGE_VERSION)
 GO_TAGS ?= -tags=$(shell echo $(GO_TAGS_LIST) | tr ' ' ',')
 
 BASE_IMAGE ?= $(shell . $(CURDIR)/build.env ; echo $${BASE_IMAGE})
+HARDENED_BASE_IMAGE ?= $(shell . $(CURDIR)/build.env ; echo $${HARDENED_BASE_IMAGE})
 
 # passing TARGET=static-check on the 'make containerized-test' or 'make
 # containerized-build' commandline will run the selected target instead of
@@ -264,6 +265,15 @@ push-image-cephcsi: GOARCH ?= $(shell go env GOARCH 2>/dev/null)
 push-image-cephcsi: .container-cmd image-cephcsi
 	$(CONTAINER_CMD) tag $(CSI_IMAGE) $(CSI_IMAGE)-$(GOARCH)
 	$(CONTAINER_CMD) push $(CSI_IMAGE)-$(GOARCH)
+
+image-cephcsi-hardened: GOARCH ?= $(shell go env GOARCH 2>/dev/null)
+image-cephcsi-hardened: .container-cmd
+	$(CONTAINER_CMD) build $(CPUSET) -t $(CSI_IMAGE)-hardened -f deploy/cephcsi/image/Dockerfile.hardened . --build-arg CSI_IMAGE_NAME=$(CSI_IMAGE_NAME) --build-arg CSI_IMAGE_VERSION=$(CSI_IMAGE_VERSION) --build-arg GIT_COMMIT=$(GIT_COMMIT) --build-arg GO_ARCH=$(GOARCH) --build-arg CEPH_VERSION=$(CEPH_VERSION) --build-arg HARDENED_BASE_IMAGE=$(HARDENED_BASE_IMAGE)
+
+push-image-cephcsi-hardened: GOARCH ?= $(shell go env GOARCH 2>/dev/null)
+push-image-cephcsi-hardened: .container-cmd image-cephcsi-hardened
+	$(CONTAINER_CMD) tag $(CSI_IMAGE)-hardened $(CSI_IMAGE)-hardened-$(GOARCH)
+	$(CONTAINER_CMD) push $(CSI_IMAGE)-hardened-$(GOARCH)
 
 create-manifest: GOARCH ?= $(shell go env GOARCH 2>/dev/null)
 create-manifest: .container-cmd
