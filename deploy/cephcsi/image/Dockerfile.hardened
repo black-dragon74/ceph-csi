@@ -2,6 +2,39 @@ ARG SRC_DIR="/go/src/github.com/ceph/ceph-csi/"
 ARG GO_ARCH
 ARG HARDENED_BASE_IMAGE=debian:bookworm-slim
 
+#-- Stage 1: Collect Ceph native runtime artifacts
+#   Install full Ceph packages on bookworm, then cherry-pick only the native
+#   C/C++ binaries and shared libraries (no Python, no docs, no config).
+#   This mirrors how DHI extracts artifacts from their pre-built Ceph image.
+FROM ${HARDENED_BASE_IMAGE} AS ceph-base
+
+ARG CEPH_VERSION=tentacle
+
+RUN find /usr/lib -name '*.so*' \( -type f -o -type l \) 2>/dev/null | sort > /baseline-libs.txt
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg \
+    && curl -fsSL https://download.ceph.com/keys/release.asc \
+        | gpg --dearmor -o /usr/share/keyrings/ceph-archive-keyring.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/ceph-archive-keyring.gpg] https://download.ceph.com/debian-${CEPH_VERSION}/ bookworm main" \
+        > /etc/apt/sources.list.d/ceph.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ceph-common ceph-fuse rbd-nbd \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    mkdir -p /runtime/usr/bin; \
+    for bin in rbd ceph-fuse rbd-nbd; do \
+        [ -f "/usr/bin/$bin" ] && cp -a "/usr/bin/$bin" "/runtime/usr/bin/"; \
+    done; \
+    find /usr/lib -name '*.so*' \( -type f -o -type l \) 2>/dev/null \
+        | sort | comm -13 /baseline-libs.txt - | while read -r f; do \
+        mkdir -p "/runtime$(dirname "$f")"; \
+        cp -a "$f" "/runtime$f"; \
+    done
+
+#-- Stage 2: Build cephcsi binary
 FROM ${HARDENED_BASE_IMAGE} AS builder
 
 LABEL stage="build"
@@ -50,11 +83,10 @@ COPY . ${SRC_DIR}
 
 RUN make cephcsi
 
-#-- Final container (hardened)
+#-- Stage 3: Minimal hardened runtime
 FROM ${HARDENED_BASE_IMAGE}
 
 ARG SRC_DIR
-ARG CEPH_VERSION=tentacle
 ARG CSI_IMAGE_VERSION=canary
 ARG GO_ARCH
 
@@ -66,13 +98,6 @@ LABEL maintainers="Ceph-CSI Authors" \
     org.opencontainers.image.licenses="Apache-2.0"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl gnupg \
-    && curl -fsSL https://download.ceph.com/keys/release.asc \
-        | gpg --dearmor -o /usr/share/keyrings/ceph-archive-keyring.gpg \
-    && echo "deb [signed-by=/usr/share/keyrings/ceph-archive-keyring.gpg] https://download.ceph.com/debian-${CEPH_VERSION}/ bookworm main" \
-        > /etc/apt/sources.list.d/ceph.list \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends \
         ca-certificates \
         cryptsetup-bin \
         e2fsprogs \
@@ -83,14 +108,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         tzdata \
         util-linux \
         xfsprogs \
-        librados2 \
-        librbd1 \
-        libcephfs2 \
-        ceph-common \
-        ceph-fuse \
-        rbd-nbd \
-    && apt-get purge -y --auto-remove gnupg curl \
     && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ceph-base /runtime/ /
+RUN ldconfig
 
 RUN mkdir -p /etc/ceph \
     && ln -sf /proc/mounts /etc/mtab \
