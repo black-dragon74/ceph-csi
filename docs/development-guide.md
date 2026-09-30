@@ -253,6 +253,20 @@ A few labels interact with automation around the pull requests:
 * ci/skip/e2e: skip running e2e CI jobs
 * ci/skip/multi-arch-build: skip building container images for different architectures
 * ok-to-test: PR is ready for e2e testing.
+* ci/retry/e2e: let the periodic retest action retrigger failed e2e jobs, see
+  [Retesting failed Jobs](#retesting-failed-jobs)
+
+Two more labels are set by the automation itself, they are not meant to be
+added or removed by hand:
+
+* ci/in-progress/e2e: a round of e2e jobs was triggered for the current head
+  commit and has not finished yet. It keeps the automation from starting a
+  second round on top of the first one. It is dropped once every `ci/centos`
+  job of that round reported a result, and whenever a new commit is pushed.
+* queued/rebase: `/queue` is rebasing this pull request. It is short lived and
+  is removed again once the rebase was pushed. It is only set on branches that
+  run e2e jobs. A periodic sweep removes it, and says so on the pull request,
+  if it is ever left behind.
 
 **Review Process:**
 Once your PR has been submitted for review the following criteria will
@@ -281,10 +295,21 @@ need to be met before it will be merged:
 When the criteria are met, a project maintainer can instruct the automation to
 queue the PR for merging by commenting `/queue` on the pull request.
 
-The `/queue` command adds the `queued/rebase` label, asks Mergify to rebase the
-pull request on the latest HEAD of the branch, and after the rebase push adds
-the `ok-to-test` label so e2e testing can start before the PR is queued for
-merging.
+The `/queue` command is handled by a GitHub workflow, not by Mergify. It starts
+by checking whether the pull request is still behind its base branch:
+
+* If it is behind, the workflow sets the `queued/rebase` label, rebases the
+  branch itself and force pushes it. GitHub refuses to rebase a fork branch on
+  behalf of a user, so a pull request from a fork needs "Allow edits from
+  maintainers" enabled for this to work. The push then leads to the
+  `ok-to-test` label, and `queued/rebase` is removed again.
+* If it is already up to date, `ok-to-test` is added straight away, unless a
+  round of e2e is still running for that same commit.
+
+Either way `ok-to-test` starts e2e testing before Mergify queues the pull
+request for merging. Rebase conflicts, a closed pull request, a fork that does
+not allow edits and other failures are reported back as a comment on the pull
+request, so that `/queue` can be repeated once they are resolved.
 
 ### Backport a Fix to a Release Branch
 
@@ -342,4 +367,4 @@ for auto retesting the failed PR.
 
 * Analyze the logs and make sure its a flaky test.
 * Pull Request should have required approvals.
-* `ci/retest/e2e` label should be set on the PR.
+* `ci/retry/e2e` label should be set on the PR.

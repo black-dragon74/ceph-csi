@@ -1,0 +1,289 @@
+---
+name: Clear stale CI labels
+
+# Jenkins reports the ci/centos jobs as commit statuses. Nothing else notices
+# when a round of e2e finishes, so without this the ci/in-progress/e2e label
+# survives until the next push and keeps blocking both the mergify rule that
+# starts e2e and the guard in the /queue workflow.
+#
+# queued/rebase has no reporter of its own either. It is removed by the
+# sync-e2e-labels job in queue-rebase-and-label.yaml, which GitHub only runs
+# on base branches that carry that file, so a rebase anywhere else leaves the
+# label behind for good. The scheduled sweep below is the backstop for both.
+#
+# Only the copy of this file on the default branch ever runs, neither a status
+# nor a schedule event is attached to a pull request. Changes here take effect
+# after merging.
+# yamllint disable-line rule:truthy
+on:
+  status:
+  # A status event is the fast path, but every one of them is ignored while
+  # the label is younger than the grace period below. A round whose jobs all
+  # report inside that window produces no event afterwards, which would leave
+  # the label behind until the next push. The sweep picks those up.
+  schedule:
+    - cron: "*/30 * * * *"
+
+# Every job of a round reports on the same head commit, so a round delivers a
+# status event per job within a few minutes. Grouping on the commit keeps that
+# to one run instead of one per job, each of which would page through the
+# whole timeline of the pull request. The run that survives is the last one,
+# which reads the same final state anyway.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.sha || github.event_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: write
+
+jobs:
+  clear-in-progress-e2e:
+    if: >
+      github.repository == 'ceph/ceph-csi' &&
+      (github.event_name == 'schedule' ||
+      (startsWith(github.event.context, 'ci/centos/') &&
+      github.event.state != 'pending'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove the label once no ci/centos job is pending
+        # yamllint disable-line rule:line-length
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        with:
+          github-token: ${{ secrets.CEPH_CSI_BOT_TOKEN }}
+          script: |
+            const label = 'ci/in-progress/e2e'
+            const scheduled = context.eventName === 'schedule'
+            // How long a round gets to put its first ci/centos job in the
+            // pending state, and how long it gets to report at all before
+            // the round is written off as never started.
+            const settleTime = 5 * 60 * 1000
+            const reportTime = 2 * 60 * 60 * 1000
+
+            // A status event carries a commit, not a pull request. Forks are
+            // covered as well, their head commit is reachable through
+            // refs/pull/<n>/head in this repository. The sweep has no commit
+            // to start from and looks at every pull request still labelled.
+            let numbers = []
+            if (scheduled) {
+              const issues = await github.paginate(
+                github.rest.issues.listForRepo,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  state: 'open',
+                  labels: label
+                }
+              )
+              numbers = issues
+                .filter((issue) => issue.pull_request)
+                .map((issue) => issue.number)
+            } else {
+              const associated = await github.rest.repos
+                .listPullRequestsAssociatedWithCommit({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  commit_sha: context.payload.sha
+                })
+              numbers = associated.data.map((ref) => ref.number)
+            }
+
+            for (const number of numbers) {
+              const pr = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: number
+              })
+
+              if (pr.data.state !== 'open') {
+                continue
+              }
+
+              // A status can still arrive for a commit that was rebased away
+              // in the meantime. Clearing the label on that would unguard the
+              // round that is running on the new head.
+              if (!scheduled && pr.data.head.sha !== context.payload.sha) {
+                core.info(
+                  `ignoring status for outdated commit ${context.payload.sha}`
+                )
+
+                continue
+              }
+
+              if (!pr.data.labels.some((l) => l.name === label)) {
+                continue
+              }
+
+              // Jenkins reports a job as pending once it is queued, but it
+              // needs a moment to get there after the /test comment. A job
+              // that fails within seconds can beat its siblings to that first
+              // pending status, which looks just like a finished round. Give
+              // the whole set time to report before believing it.
+              const events = await github.paginate(
+                github.rest.issues.listEvents,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: number
+                }
+              )
+              const applied = events.filter(
+                (e) => e.event === 'labeled' &&
+                  e.label && e.label.name === label
+              ).pop()
+
+              // Without a labelled event to date the round from, assume the
+              // label is old rather than leave it in place for good.
+              const age = applied
+                ? Date.now() - Date.parse(applied.created_at)
+                : Infinity
+
+              if (age < settleTime) {
+                core.info('label is too fresh, waiting for the other jobs')
+
+                continue
+              }
+
+              // The combined status collapses to the latest state per
+              // context, listCommitStatusesForRef would need deduplication.
+              // It is paginated though, and a page that cuts off a pending
+              // job would clear the label in the middle of a round.
+              const combined = await github.rest.repos
+                .getCombinedStatusForRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: pr.data.head.sha,
+                  per_page: 100
+                })
+              const reported = combined.data.statuses.filter(
+                (s) => s.context.startsWith('ci/centos/')
+              )
+              const pending = reported.filter((s) => s.state === 'pending')
+
+              // Nothing reported at all reads exactly like a finished round
+              // here, while it usually means Jenkins has not picked up the
+              // /test comments yet. The settle time above is too short to
+              // tell those apart when Jenkins is backed up, so keep the
+              // label until a job shows up. A round that never reports would
+              // hold on to it for good, so give up after reportTime and say
+              // so, the label guards nothing at that point anyway.
+              if (reported.length === 0) {
+                if (age < reportTime) {
+                  core.info('no ci/centos job reported yet, still waiting')
+
+                  continue
+                }
+
+                core.info('no ci/centos job ever reported, clearing')
+              } else if (pending.length !== 0) {
+                core.info(`${pending.length} ci/centos jobs still pending`)
+
+                continue
+              }
+
+              try {
+                await github.rest.issues.removeLabel({
+                  issue_number: number,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: label
+                })
+              } catch (e) {
+                // 404 means the label is already gone, ignore it.
+                if (e.status !== 404) throw e
+
+                continue
+              }
+
+              if (reported.length === 0) {
+                await github.rest.issues.createComment({
+                  issue_number: number,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  body: '⚠️ None of the `ci/centos` jobs reported a result ' +
+                    'for the current commit, so the round of e2e tests ' +
+                    'never started. The `ci/in-progress/e2e` label is ' +
+                    'removed now, please comment `/queue` again.'
+                })
+              }
+            }
+
+  # A status says nothing about a rebase, so this only runs on the schedule.
+  clear-queued-rebase:
+    if: >
+      github.repository == 'ceph/ceph-csi' &&
+      github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove queued/rebase once the rebase can no longer be running
+        # yamllint disable-line rule:line-length
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        with:
+          github-token: ${{ secrets.CEPH_CSI_BOT_TOKEN }}
+          script: |
+            const label = 'queued/rebase'
+            // /queue sets the label just before it pushes, and the push is
+            // what removes it again, so it lives for a couple of minutes at
+            // most. Anything older than this was abandoned on the way.
+            const staleAfter = 30 * 60 * 1000
+
+            const issues = await github.paginate(
+              github.rest.issues.listForRepo,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                labels: label
+              }
+            )
+
+            for (const issue of issues) {
+              if (!issue.pull_request) {
+                continue
+              }
+
+              const events = await github.paginate(
+                github.rest.issues.listEvents,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number
+                }
+              )
+              const applied = events.filter(
+                (e) => e.event === 'labeled' &&
+                  e.label && e.label.name === label
+              ).pop()
+
+              if (applied &&
+                  Date.now() - Date.parse(applied.created_at) < staleAfter) {
+                continue
+              }
+
+              try {
+                await github.rest.issues.removeLabel({
+                  issue_number: issue.number,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: label
+                })
+              } catch (e) {
+                // 404 means the label is already gone, ignore it.
+                if (e.status !== 404) throw e
+
+                continue
+              }
+
+              // Reaching this point means the push never handed over to
+              // sync-e2e-labels, so nothing added ok-to-test either.
+              await github.rest.issues.createComment({
+                issue_number: issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: '⚠️ The `queued/rebase` label was left behind, so the ' +
+                  '`/queue` rebase never handed over to the e2e jobs. The ' +
+                  'label is removed now, please check the state of the ' +
+                  'branch and comment `/queue` again.'
+              })
+            }

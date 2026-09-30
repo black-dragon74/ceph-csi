@@ -38,7 +38,29 @@ jobs:
             if (
               `${context.repo.owner}/${context.repo.repo}` === 'ceph/ceph-csi'
             ) {
-              for (const version of kubeVersions[branch] || []) {
+              // A new release branch without an entry here would silently get
+              // the upgrade tests below and nothing else, while mergify keeps
+              // waiting for the per-version statuses that never arrive. Say so
+              // instead of leaving the pull request unmergeable without a
+              // reason.
+              if (!(branch in kubeVersions)) {
+                await github.rest.issues.createComment({
+                  issue_number: context.issue.number,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  body: '❌ No Kubernetes versions are configured for the ' +
+                    `\`${branch}\` branch, so the e2e jobs can not be ` +
+                    'triggered. Add the branch to `kubeVersions` in ' +
+                    '`.github/workflows/pull-request-commentor.yaml`.'
+                });
+                core.setFailed(
+                  `no kubernetes versions configured for ${branch}`
+                );
+
+                return;
+              }
+
+              for (const version of kubeVersions[branch]) {
                 tests.push(`ci/centos/k8s-e2e-external-storage/${version}`);
                 tests.push(`ci/centos/mini-e2e/k8s-${version}`);
 
@@ -83,11 +105,11 @@ jobs:
         with:
           github-token: ${{ secrets.CEPH_CSI_BOT_TOKEN }}
           script: |
-            github.rest.issues.addLabels({
+            await github.rest.issues.addLabels({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              labels: ["ci/in-progress/e2e"]
+              labels: ['ci/in-progress/e2e']
             })
 
       - name: remove ok-to-test-label after commenting
@@ -96,9 +118,14 @@ jobs:
         with:
           github-token: ${{ secrets.CEPH_CSI_BOT_TOKEN }}
           script: |
-            github.rest.issues.removeLabel({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              name: ["ok-to-test"]
-            })
+            try {
+              await github.rest.issues.removeLabel({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'ok-to-test'
+              })
+            } catch (e) {
+              // 404 means the label is already gone, ignore it.
+              if (e.status !== 404) throw e
+            }

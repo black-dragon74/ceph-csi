@@ -6,10 +6,13 @@ on:
   issue_comment:
     types:
       - created
+  # Not filtered on branches: /queue is accepted on a pull request against any
+  # branch, so this should clean up the queued/rebase and ci/in-progress/e2e
+  # labels wherever the rebase happened. GitHub runs a pull_request_target
+  # workflow from the base branch though, so it only reaches the branches that
+  # carry this file. A base branch without it leaves both labels behind, the
+  # sweep in clear-stale-ci-labels.yaml is the backstop for that.
   pull_request_target:
-    branches:
-      - devel
-      - "release-v*"
     types:
       - synchronize
 
@@ -28,6 +31,10 @@ jobs:
       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
     # yamllint enable rule:line-length
     runs-on: ubuntu-latest
+    concurrency:
+      # yamllint disable-line rule:line-length
+      group: queue-rebase-${{ github.event.issue.number || github.event.pull_request.number }}
+      cancel-in-progress: false
     steps:
       - name: React to triggering comment
         # yamllint disable-line rule:line-length
@@ -59,6 +66,12 @@ jobs:
               repo: context.repo.repo,
               pull_number: context.issue.number
             })
+            if (pr.data.state !== 'open') {
+              core.exportVariable('FAIL_REASON',
+                '`/queue` only works on an open pull request.')
+              core.setFailed('pull request is not open')
+              return
+            }
             if (!pr.data.head.repo) {
               core.exportVariable('FAIL_REASON',
                 'The source branch or its fork repository no longer ' +
@@ -68,9 +81,16 @@ jobs:
             }
             const headRepo = pr.data.head.repo.full_name
             const baseRepo = pr.data.base.repo.full_name
-            const labels = pr.data.labels.map((label) => label.name)
-            core.setOutput('skip_e2e', String(labels.includes('ci/skip/e2e')))
-            core.setOutput('base_ref', pr.data.base.ref)
+            const baseRef = pr.data.base.ref
+            // The e2e labels are deliberately not exported here, this job
+            // runs long enough for such a snapshot to go stale. They are
+            // read again in the step that acts on them.
+            //
+            // Only devel and the release branches have e2e jobs behind the
+            // ok-to-test label.
+            core.setOutput('e2e_branch',
+              String(/^(devel|release-v.+)$/.test(baseRef)))
+            core.setOutput('base_ref', baseRef)
             core.setOutput('head_ref', pr.data.head.ref)
             core.setOutput('head_sha', pr.data.head.sha)
             core.setOutput('head_repo', headRepo)
@@ -125,8 +145,14 @@ jobs:
             echo "PR needs rebase"
           fi
 
+      # The label is only the hand-over marker that tells sync-e2e-labels the
+      # push it sees came from /queue and should continue into e2e. A branch
+      # without e2e jobs has nothing to hand over, and ci/centos does not even
+      # carry this workflow, so setting the label there would only strand it.
       - name: Add queued/rebase label
-        if: steps.check_rebase.outputs.needs_rebase == 'true'
+        if: >
+          steps.check_rebase.outputs.needs_rebase == 'true' &&
+          steps.pr.outputs.e2e_branch == 'true'
         # yamllint disable-line rule:line-length
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         with:
@@ -141,7 +167,7 @@ jobs:
 
       # Rebase in the workflow instead of asking mergify, because GitHub refuses
       # to rebase a fork pull request on behalf of a user. The push triggers the
-      # synchronize event that the add-ok-to-test-label job requires.
+      # synchronize event that the sync-e2e-labels job requires.
       - name: Rebase PR branch on base and push
         id: rebase
         if: steps.check_rebase.outputs.needs_rebase == 'true'
@@ -178,6 +204,21 @@ jobs:
               echo "Rebasing this pull request on \`$BASE_REF\` hit conflicts."
               echo "Please rebase it manually, resolve the conflicts and force"
               echo "push, then comment \`/queue\` again."
+              echo "EOF"
+            } >> "$GITHUB_ENV"
+            exit 1
+          fi
+
+          # A pull request whose commits all landed on the base branch
+          # already rebases to nothing. Force pushing that would move the
+          # branch to the base tip and leave an empty pull request behind.
+          if [ -z "$(git rev-list "upstream/$BASE_REF..HEAD")" ]; then
+            {
+              echo "FAIL_REASON<<EOF"
+              echo "Rebasing this pull request on \`$BASE_REF\` left no"
+              echo "commits, its changes are already on the branch. The"
+              echo "branch was not touched, please close this pull request"
+              echo "or push the commits that are still missing."
               echo "EOF"
             } >> "$GITHUB_ENV"
             exit 1
@@ -233,15 +274,50 @@ jobs:
               if (e.status !== 404) throw e
             }
 
-      - name: Add ok-to-test label directly
+      # The head did not move, so no synchronize event follows and nothing else
+      # will start e2e. The labels were read before the checkout and the base
+      # branch fetch, long enough for a round to have started since, so read
+      # them back instead of acting on that snapshot.
+      - name: Start e2e for the current head
         if: >
           steps.check_rebase.outputs.needs_rebase == 'false' &&
-          steps.pr.outputs.skip_e2e == 'false'
+          steps.pr.outputs.e2e_branch == 'true'
         # yamllint disable-line rule:line-length
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         with:
           github-token: ${{ secrets.CEPH_CSI_BOT_TOKEN }}
           script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            })
+            const labels = pr.data.labels.map((label) => label.name)
+
+            if (labels.includes('ci/skip/e2e')) {
+              core.info(
+                'Skipping ok-to-test label because ci/skip/e2e is set'
+              )
+
+              return
+            }
+
+            // A round already in progress is testing the very commit /queue
+            // was asked about, starting a second one only duplicates the jobs.
+            if (labels.includes('ci/in-progress/e2e')) {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: 'ℹ️ This pull request is up to date with its base ' +
+                  'branch and e2e is already running for this commit, so ' +
+                  '`/queue` has nothing to start. Use `/retest <job>` to ' +
+                  'rerun a single job.'
+              })
+
+              return
+            }
+
             await github.rest.issues.addLabels({
               issue_number: context.issue.number,
               owner: context.repo.owner,
@@ -249,46 +325,126 @@ jobs:
               labels: ['ok-to-test']
             })
 
-  add-ok-to-test-label:
+  # Refreshes the e2e labels whenever the head commit changes. Dropping
+  # ci/in-progress/e2e is deliberately not gated on who pushed: the label
+  # describes a round of e2e jobs started for one commit, so any new head
+  # invalidates it, a mergify merge queue update included.
+  sync-e2e-labels:
     if: >
       github.repository == 'ceph/ceph-csi' &&
-      github.event_name == 'pull_request_target' &&
-      (github.actor == 'ceph-csi-bot' || github.actor == 'mergify[bot]')
+      github.event_name == 'pull_request_target'
     runs-on: ubuntu-latest
+    concurrency:
+      group: sync-e2e-labels-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
     steps:
-      - name: Add ok-to-test label after queued rebase push
+      - name: Refresh the e2e labels after a new head commit
         # yamllint disable-line rule:line-length
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         with:
           github-token: ${{ secrets.CEPH_CSI_BOT_TOKEN }}
           script: |
-            const labels = context.payload.pull_request.labels.map(
-              (label) => label.name
-            )
-            if (!labels.includes('queued/rebase')) {
+            const number = context.payload.pull_request.number
+
+            // The labels in the webhook payload are a snapshot taken when the
+            // push happened, and queued/rebase is added only moments before
+            // it. Read them back so a stale payload does not drop labels.
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: number
+            })
+            const labels = pr.data.labels.map((label) => label.name)
+
+            // Just to avoid duplication.
+            const removeLabel = async (name) => {
+              try {
+                await github.rest.issues.removeLabel({
+                  issue_number: number,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: name
+                })
+              } catch (e) {
+                // 404 means the label is already gone, ignore it.
+                if (e.status !== 404) throw e
+              }
+            }
+
+            // The push replaced the head, so an e2e run still marked as in
+            // progress belongs to a commit that is no longer being tested.
+            //
+            // Mergify can add ok-to-test for the new head while this job is
+            // still waiting for a runner, and the commentor workflow then
+            // labels that fresh round. A label applied after the push
+            // describes the new round, not the one the push invalidated, so
+            // dropping it would leave the round unguarded. The payload is a
+            // snapshot taken when the push happened, so its updated_at dates
+            // the event itself rather than this job. Keeping the label on a
+            // close call is the safe way round, the next push or the sweep
+            // in clear-stale-ci-labels.yaml still clears it.
+            let inProgress = false
+            if (labels.includes('ci/in-progress/e2e')) {
+              const pushedAt = Date.parse(
+                context.payload.pull_request.updated_at
+              )
+              const events = await github.paginate(
+                github.rest.issues.listEvents,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: number
+                }
+              )
+              const applied = events.filter(
+                (e) => e.event === 'labeled' && e.label &&
+                  e.label.name === 'ci/in-progress/e2e'
+              ).pop()
+
+              if (applied && Date.parse(applied.created_at) >= pushedAt) {
+                core.info('keeping ci/in-progress/e2e, it is a newer round')
+                inProgress = true
+              } else {
+                await removeLabel('ci/in-progress/e2e')
+              }
+            }
+
+            // Only a rebase that /queue asked for continues into e2e here.
+            const bots = ['ceph-csi-bot', 'mergify[bot]']
+            if (!bots.includes(context.actor) ||
+                !labels.includes('queued/rebase')) {
               core.info(
-                'Skipping ok-to-test label because queued/rebase is not set'
+                'Skipping ok-to-test, this is not a queued rebase push'
               )
 
               return
             }
 
-            if (labels.includes('ci/skip/e2e')) {
+            const baseRef = pr.data.base.ref
+            if (!/^(devel|release-v.+)$/.test(baseRef)) {
+              core.info(
+                `Skipping ok-to-test label, ${baseRef} has no e2e jobs`
+              )
+            } else if (labels.includes('ci/skip/e2e')) {
               core.info(
                 'Skipping ok-to-test label because ci/skip/e2e is set'
               )
+            } else if (inProgress) {
+              // The label was kept above because it describes a round that
+              // was started for this very head, by mergify labelling the
+              // pushed commit before this job got a runner. Adding
+              // ok-to-test again would only comment a second set of /test
+              // commands and duplicate that round.
+              core.info(
+                'Skipping ok-to-test, a round already runs for this head'
+              )
             } else {
               await github.rest.issues.addLabels({
-                issue_number: context.payload.pull_request.number,
+                issue_number: number,
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 labels: ['ok-to-test']
               })
             }
 
-            await github.rest.issues.removeLabel({
-              issue_number: context.payload.pull_request.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              name: 'queued/rebase'
-            })
+            await removeLabel('queued/rebase')
